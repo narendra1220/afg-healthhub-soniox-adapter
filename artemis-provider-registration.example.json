@@ -1,0 +1,13 @@
+{
+  "displayName": "Soniox adapter",
+  "serviceType": "custom:soniox-adapter",
+  "apiKey": "<ADAPTER_AUTH_TOKEN>",
+  "isDefault": false,
+  "config": {
+    "useForStt": true,
+    "useForTts": false,
+    "sttEndpoint": "wss://<PUBLIC_ADAPTER_HOST>/stt",
+    "sttLanguages": [{ "code": "en" }],
+    "defaultLanguage": "en"
+  }
+}
