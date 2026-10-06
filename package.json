@@ -1,0 +1,18 @@
+{
+  "name": "afg-healthhub-soniox-byo-adapter",
+  "version": "0.1.0",
+  "private": true,
+  "description": "English-only Soniox streaming STT adapter for an Artemis Pipeline Voice channel",
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "check": "node --check adapter.mjs && node --check offline-test.mjs && node --check probe-stt.mjs",
+    "test": "node offline-test.mjs",
+    "start": "node adapter.mjs"
+  },
+  "dependencies": {
+    "ws": "8.21.0"
+  }
+}

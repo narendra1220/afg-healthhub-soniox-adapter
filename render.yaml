@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: afg-healthhub-soniox-adapter
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: ADAPTER_AUTH_TOKEN
+        sync: false
+      - key: SONIOX_API_KEY
+        sync: false
+      - key: SONIOX_STT_MODEL
+        value: stt-rt-v5
+      - key: ADAPTER_HOST
+        value: 0.0.0.0
