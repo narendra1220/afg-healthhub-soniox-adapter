@@ -155,6 +155,8 @@ const adapter = createAdapter({
   sonioxKey: FAKE_SONIOX_KEY,
   sttUrl: `ws://127.0.0.1:${fakePort}/stt`,
   sttModel: 'offline-stt',
+  sttAutoFinalizeSilenceMs: 20,
+  sttSilenceRmsThreshold: 1,
   ttsUrl: `ws://127.0.0.1:${fakePort}/tts`,
   ttsModel: 'offline-tts',
   ttsVoice: 'offline-voice',
@@ -189,6 +191,33 @@ try {
   stt.send(JSON.stringify({ type: 'finalize' }));
   const secondResult = await secondTranscriptPromise;
   assert.equal(secondResult.alternatives[0].transcript, 'Second turn.');
+
+  // A real Artemis stream does not send the adapter-specific finalize control.
+  // A short PCM silence boundary must still finalize a third turn.
+  const autoFinalTranscriptPromise = waitFor(stt, (value) => value.is_final === true);
+  stt.send(pcm);
+  const autoFinalResult = await autoFinalTranscriptPromise;
+  assert.equal(autoFinalResult.alternatives[0].transcript, 'Second turn.');
+
+  // A stop arriving before the upstream endpoint must drain the pending turn
+  // instead of dropping it silently.
+  const stopDrain = await openClient(`ws://127.0.0.1:${adapterPort}/stt`);
+  const stopFinalTranscriptPromise = waitFor(stopDrain, (value) => value.is_final === true);
+  stopDrain.send(
+    JSON.stringify({
+      type: 'start',
+      language: 'en',
+      format: 'raw',
+      encoding: 'LINEAR16',
+      sampleRateHz: 16000,
+      interimResults: true,
+    }),
+  );
+  stopDrain.send(pcm);
+  stopDrain.send(JSON.stringify({ type: 'stop' }));
+  const stopFinalResult = await stopFinalTranscriptPromise;
+  assert.equal(stopFinalResult.alternatives[0].transcript, 'Hello world!');
+  await once(stopDrain, 'close');
 
   const config = upstreamConfigs.find((entry) => entry.path === '/stt').config;
   assert.equal(config.audio_format, 'pcm_s16le');

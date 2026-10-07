@@ -10,6 +10,9 @@ const MAX_TEXT = 16_000;
 const MAX_CONNECTIONS = 25;
 const MAX_SESSION_MS = 15 * 60 * 1000;
 const START_TIMEOUT_MS = 10_000;
+const DEFAULT_AUTO_FINALIZE_SILENCE_MS = 750;
+const DEFAULT_SILENCE_RMS_THRESHOLD = 200;
+const STOP_FINALIZE_TIMEOUT_MS = 2_000;
 const SUPPORTED_SAMPLE_RATES = new Set([8000, 16000, 24000, 48000]);
 const SUPPORTED_TTS_SAMPLE_RATES = new Set([8000, 16000, 24000, 44100, 48000]);
 const LOG_TRANSCRIPTS = process.env.ADAPTER_LOG_TRANSCRIPTS === 'true';
@@ -59,6 +62,31 @@ function authorized(header, expected, allowLegacyTtsHeader = false) {
 
 function clearTimer(timer) {
   if (timer) clearTimeout(timer);
+}
+
+function nonNegativeNumber(value, fallback) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : fallback;
+}
+
+function pcmRms(pcm) {
+  if (!Buffer.isBuffer(pcm) || pcm.length < 2) return 0;
+
+  let sum = 0;
+  let count = 0;
+  for (let offset = 0; offset + 1 < pcm.length; offset += 2) {
+    sum += pcm.readInt16LE(offset);
+    count += 1;
+  }
+  if (!count) return 0;
+
+  const mean = sum / count;
+  let squared = 0;
+  for (let offset = 0; offset + 1 < pcm.length; offset += 2) {
+    const centered = pcm.readInt16LE(offset) - mean;
+    squared += centered * centered;
+  }
+  return Math.sqrt(squared / count);
 }
 
 export function createTranscriptBuffer() {
@@ -153,6 +181,15 @@ function attachStt(downstream, cfg, connectionId) {
   let controlQueue = [];
   let sampleRateHz;
   let language;
+  let silenceTimer;
+  let stopTimer;
+  let stopRequested = false;
+  let finalizationInFlight = false;
+  let audioSequence = 0;
+  let finalizedAudioSequence = 0;
+  let finalizeRequestSequence = 0;
+  let speechSinceEndpoint = false;
+  let lastSpeechAt = 0;
   let audioBytes = 0;
   let audioFrames = 0;
   let finalCount = 0;
@@ -176,6 +213,8 @@ function attachStt(downstream, cfg, connectionId) {
     clearTimer(startDeadline);
     clearTimer(lifetime);
     clearInterval(keepalive);
+    clearTimer(silenceTimer);
+    clearTimer(stopTimer);
     queue = [];
     queuedBytes = 0;
     controlQueue = [];
@@ -209,7 +248,7 @@ function attachStt(downstream, cfg, connectionId) {
     }
   }
 
-  function stop() {
+  function finishStop() {
     if (closing) return;
     closing = true;
     logEvent('ASR_STOP', {
@@ -222,6 +261,69 @@ function attachStt(downstream, cfg, connectionId) {
     if (downstream.readyState === WebSocket.OPEN) {
       downstream.close(1000, 'STT stopped');
     }
+  }
+
+  function requestFinalize(reason) {
+    if (closing || !started) return false;
+    if (finalizationInFlight || audioSequence <= finalizedAudioSequence) return false;
+
+    finalizationInFlight = true;
+    finalizeRequestSequence = audioSequence;
+    logEvent('ASR_FINALIZE_REQUEST', {
+      connectionId,
+      reason,
+      audioFrames,
+      audioBytes,
+    });
+    try {
+      if (upstream?.readyState === WebSocket.OPEN) {
+        sendJson(upstream, { type: 'finalize' });
+      } else {
+        controlQueue.push({ type: 'finalize' });
+      }
+      return true;
+    } catch {
+      fail('FINALIZE_FORWARD_ERROR');
+      return false;
+    }
+  }
+
+  function scheduleSilenceFinalize() {
+    clearTimer(silenceTimer);
+    silenceTimer = undefined;
+    if (
+      closing ||
+      !speechSinceEndpoint ||
+      finalizationInFlight ||
+      cfg.sttAutoFinalizeSilenceMs <= 0
+    ) {
+      return;
+    }
+
+    const elapsed = Date.now() - lastSpeechAt;
+    const waitMs = Math.max(25, cfg.sttAutoFinalizeSilenceMs - elapsed);
+    silenceTimer = setTimeout(() => {
+      silenceTimer = undefined;
+      if (Date.now() - lastSpeechAt < cfg.sttAutoFinalizeSilenceMs) {
+        scheduleSilenceFinalize();
+        return;
+      }
+      requestFinalize('pcm_silence');
+    }, waitMs);
+  }
+
+  function stop() {
+    if (closing || stopRequested) return;
+    stopRequested = true;
+    clearTimer(silenceTimer);
+
+    const needsFinalization =
+      finalizationInFlight ||
+      (audioSequence > finalizedAudioSequence && (speechSinceEndpoint || finalCount === 0));
+    if (!needsFinalization) return finishStop();
+
+    if (!finalizationInFlight) requestFinalize('gateway_stop');
+    stopTimer = setTimeout(finishStop, STOP_FINALIZE_TIMEOUT_MS);
   }
 
   function complete() {
@@ -262,6 +364,13 @@ function attachStt(downstream, cfg, connectionId) {
 
         audioBytes += data.length;
         audioFrames += 1;
+        audioSequence += 1;
+        const speechFrame = pcmRms(data) >= cfg.sttSilenceRmsThreshold;
+        if (speechFrame) {
+          speechSinceEndpoint = true;
+          lastSpeechAt = Date.now();
+        }
+        scheduleSilenceFinalize();
         if (audioFrames === 1 || audioFrames % 50 === 0) {
           logEvent('ASR_AUDIO', {
             connectionId,
@@ -283,12 +392,7 @@ function attachStt(downstream, cfg, connectionId) {
       const message = JSON.parse(data.toString());
       if (message.type === 'stop') return stop();
       if (started && message.type === 'finalize') {
-        logEvent('ASR_FINALIZE_REQUEST', { connectionId });
-        if (upstream?.readyState === WebSocket.OPEN) {
-          sendJson(upstream, { type: 'finalize' });
-        } else {
-          controlQueue.push({ type: 'finalize' });
-        }
+        requestFinalize('gateway_finalize');
         return;
       }
 
@@ -387,6 +491,23 @@ function attachStt(downstream, cfg, connectionId) {
               });
             }
             sendBounded(downstream, JSON.stringify(transcript));
+          }
+          const endpointSeen = (result.tokens ?? []).some(
+            (token) => token?.text === '<end>' || token?.text === '<fin>',
+          );
+          if (endpointSeen) {
+            const finalizedThrough = finalizationInFlight ? finalizeRequestSequence : audioSequence;
+            finalizedAudioSequence = Math.max(finalizedAudioSequence, finalizedThrough);
+            finalizationInFlight = false;
+            if (audioSequence <= finalizedAudioSequence) {
+              speechSinceEndpoint = false;
+              lastSpeechAt = 0;
+              clearTimer(silenceTimer);
+              silenceTimer = undefined;
+            } else {
+              scheduleSilenceFinalize();
+            }
+            if (stopRequested) finishStop();
           }
           if (result.finished) complete();
         } catch {
@@ -607,6 +728,14 @@ export function createAdapter(config) {
     ttsUrl: config?.ttsUrl || 'wss://tts-rt.soniox.com/tts-websocket',
     ttsModel: config?.ttsModel || 'tts-rt-v2',
     ttsVoice: config?.ttsVoice || 'Adrian',
+    sttAutoFinalizeSilenceMs: nonNegativeNumber(
+      config?.sttAutoFinalizeSilenceMs,
+      DEFAULT_AUTO_FINALIZE_SILENCE_MS,
+    ),
+    sttSilenceRmsThreshold: nonNegativeNumber(
+      config?.sttSilenceRmsThreshold,
+      DEFAULT_SILENCE_RMS_THRESHOLD,
+    ),
   };
   validateConfig(effectiveConfig);
 
@@ -676,6 +805,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
         process.env.SONIOX_STT_WS_URL ||
         'wss://stt-rt.soniox.com/transcribe-websocket',
       sttModel: process.env.SONIOX_STT_MODEL || 'stt-rt-v5',
+      sttAutoFinalizeSilenceMs: Number(
+        process.env.SONIOX_STT_AUTO_FINALIZE_SILENCE_MS || DEFAULT_AUTO_FINALIZE_SILENCE_MS,
+      ),
+      sttSilenceRmsThreshold: Number(
+        process.env.SONIOX_STT_SILENCE_RMS_THRESHOLD || DEFAULT_SILENCE_RMS_THRESHOLD,
+      ),
       ttsUrl:
         process.env.SONIOX_TTS_WS_URL ||
         'wss://tts-rt.soniox.com/tts-websocket',

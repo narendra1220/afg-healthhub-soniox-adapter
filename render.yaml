@@ -12,6 +12,10 @@ services:
         sync: false
       - key: SONIOX_STT_MODEL
         value: stt-rt-v5
+      - key: SONIOX_STT_AUTO_FINALIZE_SILENCE_MS
+        value: "750"
+      - key: SONIOX_STT_SILENCE_RMS_THRESHOLD
+        value: "200"
       - key: SONIOX_TTS_MODEL
         value: tts-rt-v2
       - key: SONIOX_TTS_VOICE

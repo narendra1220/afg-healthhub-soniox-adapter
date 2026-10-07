@@ -88,6 +88,8 @@ public WebSocket reachability, or an Artemis call.
 | `ADAPTER_PORT` | `8080` | HTTP/WebSocket listener port |
 | `SONIOX_STT_MODEL` | `stt-rt-v5` | Soniox real-time STT model |
 | `SONIOX_STT_WS_URL` | `wss://stt-rt.soniox.com/transcribe-websocket` | Upstream Soniox WebSocket |
+| `SONIOX_STT_AUTO_FINALIZE_SILENCE_MS` | `750` | Fallback silence duration before the adapter sends Soniox `finalize`; set to `0` to disable |
+| `SONIOX_STT_SILENCE_RMS_THRESHOLD` | `200` | PCM RMS threshold used to distinguish speech from silence |
 | `SONIOX_TTS_MODEL` | `tts-rt-v2` | Soniox real-time TTS model |
 | `SONIOX_TTS_VOICE` | `Adrian` | Default TTS voice name |
 | `SONIOX_TTS_WS_URL` | `wss://tts-rt.soniox.com/tts-websocket` | Upstream Soniox TTS WebSocket |
@@ -203,7 +205,11 @@ reply text is supplied by the test and does not come from an agent model.
 The probe sends Soniox's `{"type":"finalize"}` control after each simulated
 utterance so a single socket can be tested deterministically. Artemis normally
 uses its own VAD/endpoint lifecycle and sends `{"type":"stop"}` when it stops
-the recognition task; the adapter accepts that control and closes cleanly.
+the recognition task. The adapter also has a PCM-silence fallback because a
+custom provider must still produce a final transcript when the gateway keeps
+the audio socket open and Soniox's semantic endpoint is delayed. The same
+socket remains usable for the next utterance; `stop` drains one pending final
+before closing.
 
 ## HealthHub channel configuration
 
