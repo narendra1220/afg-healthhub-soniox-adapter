@@ -5,9 +5,12 @@
   "isDefault": false,
   "config": {
     "useForStt": true,
-    "useForTts": false,
+    "useForTts": true,
     "sttEndpoint": "wss://<PUBLIC_ADAPTER_HOST>/stt",
     "sttLanguages": [{ "code": "en" }],
+    "ttsStreamingEndpoint": "wss://<PUBLIC_ADAPTER_HOST>/tts",
+    "ttsLanguages": [{ "code": "en", "voices": [{ "value": "Adrian" }] }],
+    "voiceId": "Adrian",
     "defaultLanguage": "en"
   }
 }

@@ -69,9 +69,12 @@ const fakeHttp = http.createServer();
 const fakeWs = new WebSocketServer({ server: fakeHttp });
 fakeWs.on('connection', (ws, req) => {
   assert.equal(req.headers.authorization, `Bearer ${FAKE_SONIOX_KEY}`);
+  const path = new URL(req.url, 'http://offline-upstream').pathname;
   let config;
+  let text = '';
   ws.on('message', (body, binary) => {
     if (binary) {
+      assert.equal(path, '/stt');
       assert.deepEqual(body, pcm);
       ws.send(JSON.stringify({ tokens: [{ text: 'Hello', is_final: false }] }));
       ws.send(
@@ -87,7 +90,24 @@ fakeWs.on('connection', (ws, req) => {
       return;
     }
     const message = JSON.parse(body.toString());
-    if (message.model) upstreamConfigs.push(message);
+    if (message.model) {
+      config = message;
+      upstreamConfigs.push({ path, config });
+      return;
+    }
+    if (path !== '/tts' || !config) return;
+    assert.equal(message.stream_id, config.stream_id);
+    text += message.text;
+    if (!message.text_end) return;
+    assert.equal(text, 'Hello from TTS');
+    ws.send(
+      JSON.stringify({
+        stream_id: config.stream_id,
+        audio: pcm.toString('base64'),
+        audio_end: true,
+      }),
+    );
+    ws.send(JSON.stringify({ stream_id: config.stream_id, terminated: true }));
   });
 });
 
@@ -97,6 +117,9 @@ const adapter = createAdapter({
   sonioxKey: FAKE_SONIOX_KEY,
   sttUrl: `ws://127.0.0.1:${fakePort}/stt`,
   sttModel: 'offline-stt',
+  ttsUrl: `ws://127.0.0.1:${fakePort}/tts`,
+  ttsModel: 'offline-tts',
+  ttsVoice: 'offline-voice',
 });
 const adapterPort = await listen(adapter.server);
 
@@ -121,12 +144,40 @@ try {
   const result = await transcriptPromise;
   assert.equal(result.type, 'transcription');
   assert.equal(result.alternatives[0].transcript, 'Hello world!');
-  const config = upstreamConfigs[0];
+  const config = upstreamConfigs.find((entry) => entry.path === '/stt').config;
   assert.equal(config.audio_format, 'pcm_s16le');
   assert.equal(config.sample_rate, 16000);
   assert.equal(config.num_channels, 1);
   assert.deepEqual(config.language_hints, ['en']);
   stt.close();
+
+  const tts = new WebSocket(
+    `ws://127.0.0.1:${adapterPort}/tts?voice=offline-voice&language=en&sampleRate=8000`,
+    { headers: { Authorization: `Bearer${FAKE_ADAPTER_TOKEN}` } },
+  );
+  const connectPromise = waitFor(tts, (value) => value.type === 'connect');
+  await once(tts, 'open');
+  const connect = await connectPromise;
+  assert.deepEqual(connect, { type: 'connect', data: { sample_rate: 8000 } });
+  let audioFrames = 0;
+  tts.on('message', (data, binary) => {
+    if (binary) {
+      assert.deepEqual(data, pcm);
+      audioFrames += 1;
+    }
+  });
+  const done = waitFor(tts, (value) => value.type === 'done');
+  tts.send(JSON.stringify({ type: 'stream', text: 'Hello from ' }));
+  tts.send(JSON.stringify({ type: 'stream', text: 'TTS' }));
+  tts.send(JSON.stringify({ type: 'flush' }));
+  await done;
+  assert.equal(audioFrames, 1);
+  const ttsConfig = upstreamConfigs.find((entry) => entry.path === '/tts').config;
+  assert.equal(ttsConfig.model, 'offline-tts');
+  assert.equal(ttsConfig.language, 'en');
+  assert.equal(ttsConfig.audio_format, 'pcm_s16le');
+  assert.equal(ttsConfig.sample_rate, 8000);
+  tts.close();
 
   const invalidLanguage = await openClient(`ws://127.0.0.1:${adapterPort}/stt`);
   const languageError = waitFor(invalidLanguage, (value) => value.type === 'error');
@@ -155,7 +206,9 @@ try {
   assert.match(authError.message, /401/);
   badAuth.terminate();
 
-  console.log('PASS: offline English STT transcript, authentication, PCM, language and health checks');
+  console.log(
+    'PASS: offline English STT/TTS, authentication, PCM, language and health checks',
+  );
 } finally {
   await adapter.close();
   for (const client of fakeWs.clients) client.terminate();

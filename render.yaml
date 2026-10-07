@@ -12,5 +12,11 @@ services:
         sync: false
       - key: SONIOX_STT_MODEL
         value: stt-rt-v5
+      - key: SONIOX_TTS_MODEL
+        value: tts-rt-v2
+      - key: SONIOX_TTS_VOICE
+        value: Adrian
+      - key: ADAPTER_LOG_TRANSCRIPTS
+        value: "true"
       - key: ADAPTER_HOST
         value: 0.0.0.0

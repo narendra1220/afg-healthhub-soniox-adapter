@@ -1,13 +1,13 @@
-# HealthHub Soniox BYO STT adapter
+# HealthHub Soniox BYO speech adapter
 
-This is the first implementation increment for the AFG HealthHub Pipeline
-Voice path. It is an STT-only WebSocket adapter: Artemis sends raw caller PCM
-to `/stt`, and this service translates it to the Soniox real-time STT protocol.
+This is a test WebSocket adapter for the AFG HealthHub Pipeline Voice path.
+Artemis sends raw caller PCM to `/stt` and streamed agent text to `/tts`; this
+service translates both directions to the Soniox real-time APIs.
 
 The initial pilot deliberately supports English only. Arabic can be added later
 by extending the language map, the provider catalog, and the channel test
-matrix together. TTS remains the existing HealthHub provider and is not exposed
-by this service.
+matrix together. The initial adapter language and voice catalog is English
+only.
 
 ## Protocol implemented
 
@@ -17,6 +17,10 @@ Gateway to adapter:
 - One JSON start message with `type: "start"`, `format: "raw"`,
   `encoding: "LINEAR16"`, `language`, and `sampleRateHz`.
 - Binary, headerless signed 16-bit PCM audio frames.
+
+For TTS, Artemis connects to `/tts` with `voice`, `language` and `sampleRate`
+query parameters, sends `stream`, `flush` and `stop` JSON messages, and receives
+raw signed 16-bit PCM frames plus `connect`/`done` JSON messages.
 
 Adapter to gateway:
 
@@ -84,6 +88,10 @@ public WebSocket reachability, or an Artemis call.
 | `ADAPTER_PORT` | `8080` | HTTP/WebSocket listener port |
 | `SONIOX_STT_MODEL` | `stt-rt-v5` | Soniox real-time STT model |
 | `SONIOX_STT_WS_URL` | `wss://stt-rt.soniox.com/transcribe-websocket` | Upstream Soniox WebSocket |
+| `SONIOX_TTS_MODEL` | `tts-rt-v2` | Soniox real-time TTS model |
+| `SONIOX_TTS_VOICE` | `Adrian` | Default TTS voice name |
+| `SONIOX_TTS_WS_URL` | `wss://tts-rt.soniox.com/tts-websocket` | Upstream Soniox TTS WebSocket |
+| `ADAPTER_LOG_TRANSCRIPTS` | `false` | Includes final ASR text in logs when `true`; use only for approved test calls |
 
 The public Artemis registration will use the eventual hosted URL:
 
@@ -91,7 +99,8 @@ The public Artemis registration will use the eventual hosted URL:
 Service type: custom:soniox-adapter
 STT endpoint: wss://<host>/stt
 STT languages: en
-TTS: disabled
+TTS streaming endpoint: wss://<host>/tts
+TTS language/voice: en / Adrian
 API key: ADAPTER_AUTH_TOKEN
 ```
 
@@ -166,8 +175,9 @@ fixtures.
 
 ## HealthHub channel configuration
 
-On the dedicated Pipeline Voice test channel, register an STT-only BYO
-provider and select the saved service instance in Speech Recognition:
+On the dedicated Pipeline Voice test channel, register the BYO provider and
+select the saved service instance under Speech Recognition and Speech
+Synthesis:
 
 ```json
 {
@@ -177,8 +187,8 @@ provider and select the saved service instance in Speech Recognition:
 }
 ```
 
-Keep the existing working TTS provider selected under Speech Synthesis. Do not
-set the Soniox model in the channel; it is adapter configuration.
+Choose `en` and voice `Adrian` for the initial test. Do not set the Soniox
+models in the channel; they are adapter configuration.
 
 ## Limits and next steps
 
