@@ -11,6 +11,7 @@ readonly files_to_publish=(
   offline-test.mjs
   probe-stt.mjs
   probe-tts.mjs
+  probe-call-loop.mjs
   package.json
   pnpm-lock.yaml
   Dockerfile
@@ -45,6 +46,7 @@ readonly secret_scan_files=(
   offline-test.mjs
   probe-stt.mjs
   probe-tts.mjs
+  probe-call-loop.mjs
   package.json
   pnpm-lock.yaml
   Dockerfile

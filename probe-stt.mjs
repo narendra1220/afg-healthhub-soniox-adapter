@@ -58,6 +58,7 @@ socket.on('open', async () => {
 
   if (socket.readyState === WebSocket.OPEN) {
     socket.send(Buffer.alloc(32_000));
+    socket.send(JSON.stringify({ type: 'finalize' }));
     await delay(5000);
     socket.close();
   }

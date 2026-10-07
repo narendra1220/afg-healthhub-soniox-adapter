@@ -173,6 +173,38 @@ node probe-stt.mjs wss://<host>/stt caller-16k-mono.pcm en
 The probe logs final transcript text, so use only approved non-sensitive
 fixtures.
 
+## Persistent multi-turn call-loop probe
+
+`probe-call-loop.mjs` keeps one `/stt` socket and one `/tts` socket open while
+alternating multiple simulated call turns. The two endpoints are separate
+WebSockets, but they share the same adapter token and remain open for one
+simulated call. WAV input is converted locally with FFmpeg; no audio is sent
+anywhere except through the adapter socket.
+
+Warm Render first, then run with the same number of audio files and TTS replies:
+
+```bash
+curl --fail https://<render-host>/health
+
+ADAPTER_AUTH_TOKEN='...' \
+node probe-call-loop.mjs \
+  https://<render-host> \
+  /path/to/utterance-1.wav \
+  /path/to/utterance-2.wav \
+  --tts \
+  'Hello, how can I help?' \
+  'Your request is complete.'
+```
+
+Expected output includes one `CALL_TURN_ASR` and one `CALL_TURN_TTS` line per
+turn, followed by `CALL_LOOP_PASS`. It is a transport/protocol probe; the TTS
+reply text is supplied by the test and does not come from an agent model.
+
+The probe sends Soniox's `{"type":"finalize"}` control after each simulated
+utterance so a single socket can be tested deterministically. Artemis normally
+uses its own VAD/endpoint lifecycle and sends `{"type":"stop"}` when it stops
+the recognition task; the adapter accepts that control and closes cleanly.
+
 ## HealthHub channel configuration
 
 On the dedicated Pipeline Voice test channel, register the BYO provider and

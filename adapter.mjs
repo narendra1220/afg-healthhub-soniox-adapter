@@ -101,14 +101,20 @@ export function createTranscriptBuffer() {
     consume(result, emitInterim) {
       const output = [];
       interim = [];
+      let endpointSeen = false;
 
       for (const token of result.tokens ?? []) {
         if (!token || typeof token.text !== 'string') {
           throw new Error('INVALID_TOKEN');
         }
-        if (token.text === '<end>') {
+        // Soniox may include tokens after <end>/<fin> that belong to the
+        // response replay. They are returned again in a later response, so
+        // never let them leak into the next downstream turn.
+        if (endpointSeen) continue;
+        if (token.text === '<end>' || token.text === '<fin>') {
           const final = flush();
           if (final) output.push(final);
+          endpointSeen = true;
         } else if (token.translation_status !== 'translation') {
           (token.is_final ? stable : interim).push(token);
         }
@@ -144,6 +150,9 @@ function attachStt(downstream, cfg, connectionId) {
   let emitInterim = false;
   let queuedBytes = 0;
   let queue = [];
+  let controlQueue = [];
+  let sampleRateHz;
+  let language;
   let audioBytes = 0;
   let audioFrames = 0;
   let finalCount = 0;
@@ -169,6 +178,7 @@ function attachStt(downstream, cfg, connectionId) {
     clearInterval(keepalive);
     queue = [];
     queuedBytes = 0;
+    controlQueue = [];
     if (upstream && upstream.readyState !== WebSocket.CLOSED) {
       upstream.terminate();
     }
@@ -196,6 +206,21 @@ function attachStt(downstream, cfg, connectionId) {
     }
     if (downstream.readyState === WebSocket.OPEN) {
       downstream.close(1011, 'STT adapter error');
+    }
+  }
+
+  function stop() {
+    if (closing) return;
+    closing = true;
+    logEvent('ASR_STOP', {
+      connectionId,
+      audioBytes,
+      audioFrames,
+      finalCount,
+    });
+    cleanup();
+    if (downstream.readyState === WebSocket.OPEN) {
+      downstream.close(1000, 'STT stopped');
     }
   }
 
@@ -255,27 +280,50 @@ function attachStt(downstream, cfg, connectionId) {
         return;
       }
 
-      const start = JSON.parse(data.toString());
+      const message = JSON.parse(data.toString());
+      if (message.type === 'stop') return stop();
+      if (started && message.type === 'finalize') {
+        logEvent('ASR_FINALIZE_REQUEST', { connectionId });
+        if (upstream?.readyState === WebSocket.OPEN) {
+          sendJson(upstream, { type: 'finalize' });
+        } else {
+          controlQueue.push({ type: 'finalize' });
+        }
+        return;
+      }
+
+      if (started && message.type === 'start') {
+        // The Artemis/Jambonz contract sends start once per socket. Accept an
+        // identical duplicate defensively because some gateway revisions may
+        // replay the start envelope when a sticky gather is re-armed.
+        if (message.sampleRateHz !== sampleRateHz || languageHint(message.language) !== language) {
+          return fail('INVALID_START');
+        }
+        logEvent('ASR_START_DUPLICATE', { connectionId });
+        return;
+      }
+
       if (
         started ||
-        start.type !== 'start' ||
-        start.format !== 'raw' ||
-        start.encoding !== 'LINEAR16'
+        message.type !== 'start' ||
+        message.format !== 'raw' ||
+        message.encoding !== 'LINEAR16'
       ) {
         return fail('INVALID_START');
       }
-      if (!SUPPORTED_SAMPLE_RATES.has(start.sampleRateHz)) {
+      if (!SUPPORTED_SAMPLE_RATES.has(message.sampleRateHz)) {
         return fail('UNSUPPORTED_SAMPLE_RATE');
       }
 
-      const language = languageHint(start.language);
+      language = languageHint(message.language);
+      sampleRateHz = message.sampleRateHz;
       started = true;
-      emitInterim = start.interimResults === true;
+      emitInterim = message.interimResults === true;
       clearTimer(startDeadline);
       logEvent('ASR_START', {
         connectionId,
-        language: start.language,
-        sampleRateHz: start.sampleRateHz,
+        language: message.language,
+        sampleRateHz: message.sampleRateHz,
         interimResults: emitInterim,
       });
 
@@ -301,7 +349,7 @@ function attachStt(downstream, cfg, connectionId) {
           sendJson(upstream, {
             model: cfg.sttModel,
             audio_format: 'pcm_s16le',
-            sample_rate: start.sampleRateHz,
+            sample_rate: sampleRateHz,
             num_channels: 1,
             language_hints: [language],
             enable_endpoint_detection: true,
@@ -309,6 +357,8 @@ function attachStt(downstream, cfg, connectionId) {
           for (const chunk of queue) sendBounded(upstream, chunk, true);
           queue = [];
           queuedBytes = 0;
+          for (const control of controlQueue) sendJson(upstream, control);
+          controlQueue = [];
         } catch {
           fail('AUDIO_FORWARD_ERROR');
         }

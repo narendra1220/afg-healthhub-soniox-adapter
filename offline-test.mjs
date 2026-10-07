@@ -65,6 +65,31 @@ assert.equal(final[0].alternatives[0].transcript, 'Hello world!');
 assert.equal(final[0].is_final, true);
 assert.deepEqual(buffer.consume({ tokens: [{ text: '<end>', is_final: true }] }, true), []);
 
+const multiBuffer = createTranscriptBuffer();
+const firstWithReplay = multiBuffer.consume(
+  {
+    tokens: [
+      { text: 'first', confidence: 0.9, is_final: true },
+      { text: '<end>', is_final: true },
+      { text: 'replayed', confidence: 0.9, is_final: true },
+    ],
+  },
+  true,
+);
+assert.equal(firstWithReplay.length, 1);
+assert.equal(firstWithReplay[0].alternatives[0].transcript, 'first');
+const secondWithFin = multiBuffer.consume(
+  {
+    tokens: [
+      { text: 'second', confidence: 0.9, is_final: true },
+      { text: '<fin>', is_final: true },
+    ],
+  },
+  true,
+);
+assert.equal(secondWithFin.length, 1);
+assert.equal(secondWithFin[0].alternatives[0].transcript, 'second');
+
 const fakeHttp = http.createServer();
 const fakeWs = new WebSocketServer({ server: fakeHttp });
 fakeWs.on('connection', (ws, req) => {
@@ -72,27 +97,40 @@ fakeWs.on('connection', (ws, req) => {
   const path = new URL(req.url, 'http://offline-upstream').pathname;
   let config;
   let text = '';
+  let sttTurn = 0;
   ws.on('message', (body, binary) => {
     if (binary) {
       assert.equal(path, '/stt');
       assert.deepEqual(body, pcm);
-      ws.send(JSON.stringify({ tokens: [{ text: 'Hello', is_final: false }] }));
       ws.send(
         JSON.stringify({
-          tokens: [
-            { text: 'Hello', confidence: 0.9, is_final: true },
-            { text: ' world!', confidence: 0.9, is_final: true },
-            { text: '<end>', is_final: true },
-          ],
+          tokens: [{ text: sttTurn === 0 ? 'Hello' : 'Second', is_final: false }],
         }),
       );
-      ws.send(JSON.stringify({ finished: true }));
       return;
     }
     const message = JSON.parse(body.toString());
     if (message.model) {
       config = message;
       upstreamConfigs.push({ path, config });
+      return;
+    }
+    if (path === '/stt' && message.type === 'finalize') {
+      const tokens =
+        sttTurn === 0
+          ? [
+              { text: 'Hello', confidence: 0.9, is_final: true },
+              { text: ' world!', confidence: 0.9, is_final: true },
+              { text: '<end>', is_final: true },
+              { text: 'replayed', confidence: 0.9, is_final: true },
+            ]
+          : [
+              { text: 'Second', confidence: 0.9, is_final: true },
+              { text: ' turn.', confidence: 0.9, is_final: true },
+              { text: '<fin>', is_final: true },
+            ];
+      ws.send(JSON.stringify({ tokens }));
+      sttTurn += 1;
       return;
     }
     if (path !== '/tts' || !config) return;
@@ -141,15 +179,32 @@ try {
     }),
   );
   stt.send(pcm);
+  stt.send(JSON.stringify({ type: 'finalize' }));
   const result = await transcriptPromise;
   assert.equal(result.type, 'transcription');
   assert.equal(result.alternatives[0].transcript, 'Hello world!');
+
+  const secondTranscriptPromise = waitFor(stt, (value) => value.is_final === true);
+  stt.send(pcm);
+  stt.send(JSON.stringify({ type: 'finalize' }));
+  const secondResult = await secondTranscriptPromise;
+  assert.equal(secondResult.alternatives[0].transcript, 'Second turn.');
+
   const config = upstreamConfigs.find((entry) => entry.path === '/stt').config;
   assert.equal(config.audio_format, 'pcm_s16le');
   assert.equal(config.sample_rate, 16000);
   assert.equal(config.num_channels, 1);
   assert.deepEqual(config.language_hints, ['en']);
-  stt.close();
+  const duplicateStart = JSON.stringify({
+    type: 'start',
+    language: 'en',
+    format: 'raw',
+    encoding: 'LINEAR16',
+    sampleRateHz: 16000,
+  });
+  stt.send(duplicateStart);
+  stt.send(JSON.stringify({ type: 'stop' }));
+  await once(stt, 'close');
 
   const tts = new WebSocket(
     `ws://127.0.0.1:${adapterPort}/tts?voice=offline-voice&language=en&sampleRate=8000`,
