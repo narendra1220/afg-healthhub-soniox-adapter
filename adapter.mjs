@@ -189,7 +189,12 @@ function attachStt(downstream, cfg, connectionId) {
   let finalizedAudioSequence = 0;
   let finalizeRequestSequence = 0;
   let speechSinceEndpoint = false;
+  let audioSinceEndpoint = false;
   let lastSpeechAt = 0;
+  let lastAudioAt = 0;
+  let speechFrames = 0;
+  let silenceFrames = 0;
+  let lastAudioRms = 0;
   let audioBytes = 0;
   let audioFrames = 0;
   let finalCount = 0;
@@ -231,6 +236,9 @@ function attachStt(downstream, cfg, connectionId) {
       code,
       audioBytes,
       audioFrames,
+      lastAudioRms: Math.round(lastAudioRms),
+      speechFrames,
+      silenceFrames,
       finalCount,
     });
     cleanup();
@@ -255,6 +263,9 @@ function attachStt(downstream, cfg, connectionId) {
       connectionId,
       audioBytes,
       audioFrames,
+      lastAudioRms: Math.round(lastAudioRms),
+      speechFrames,
+      silenceFrames,
       finalCount,
     });
     cleanup();
@@ -293,22 +304,28 @@ function attachStt(downstream, cfg, connectionId) {
     silenceTimer = undefined;
     if (
       closing ||
-      !speechSinceEndpoint ||
+      (!speechSinceEndpoint && !audioSinceEndpoint) ||
       finalizationInFlight ||
       cfg.sttAutoFinalizeSilenceMs <= 0
     ) {
       return;
     }
 
-    const elapsed = Date.now() - lastSpeechAt;
+    // Some gateways deliver a low-level speech segment that is real audio but
+    // below the RMS speech threshold. Use the last received PCM packet as the
+    // fallback clock in that case so a socket cannot wait forever for stop.
+    const referenceAt = speechSinceEndpoint ? lastSpeechAt : lastAudioAt;
+    const elapsed = Date.now() - referenceAt;
     const waitMs = Math.max(25, cfg.sttAutoFinalizeSilenceMs - elapsed);
     silenceTimer = setTimeout(() => {
+      if (closing) return;
       silenceTimer = undefined;
-      if (Date.now() - lastSpeechAt < cfg.sttAutoFinalizeSilenceMs) {
+      const currentReferenceAt = speechSinceEndpoint ? lastSpeechAt : lastAudioAt;
+      if (Date.now() - currentReferenceAt < cfg.sttAutoFinalizeSilenceMs) {
         scheduleSilenceFinalize();
         return;
       }
-      requestFinalize('pcm_silence');
+      requestFinalize(speechSinceEndpoint ? 'pcm_silence' : 'audio_idle');
     }, waitMs);
   }
 
@@ -319,7 +336,7 @@ function attachStt(downstream, cfg, connectionId) {
 
     const needsFinalization =
       finalizationInFlight ||
-      (audioSequence > finalizedAudioSequence && (speechSinceEndpoint || finalCount === 0));
+      (audioSequence > finalizedAudioSequence && (audioSinceEndpoint || finalCount === 0));
     if (!needsFinalization) return finishStop();
 
     if (!finalizationInFlight) requestFinalize('gateway_stop');
@@ -333,6 +350,9 @@ function attachStt(downstream, cfg, connectionId) {
       connectionId,
       audioBytes,
       audioFrames,
+      lastAudioRms: Math.round(lastAudioRms),
+      speechFrames,
+      silenceFrames,
       finalCount,
     });
     cleanup();
@@ -348,6 +368,9 @@ function attachStt(downstream, cfg, connectionId) {
         connectionId,
         audioBytes,
         audioFrames,
+        lastAudioRms: Math.round(lastAudioRms),
+        speechFrames,
+        silenceFrames,
         finalCount,
       });
     }
@@ -365,10 +388,16 @@ function attachStt(downstream, cfg, connectionId) {
         audioBytes += data.length;
         audioFrames += 1;
         audioSequence += 1;
-        const speechFrame = pcmRms(data) >= cfg.sttSilenceRmsThreshold;
+        audioSinceEndpoint = true;
+        lastAudioAt = Date.now();
+        lastAudioRms = pcmRms(data);
+        const speechFrame = lastAudioRms >= cfg.sttSilenceRmsThreshold;
         if (speechFrame) {
+          speechFrames += 1;
           speechSinceEndpoint = true;
-          lastSpeechAt = Date.now();
+          lastSpeechAt = lastAudioAt;
+        } else {
+          silenceFrames += 1;
         }
         scheduleSilenceFinalize();
         if (audioFrames === 1 || audioFrames % 50 === 0) {
@@ -376,6 +405,9 @@ function attachStt(downstream, cfg, connectionId) {
             connectionId,
             audioFrames,
             audioBytes,
+            rms: Math.round(lastAudioRms),
+            speechFrames,
+            silenceFrames,
           });
         }
 
@@ -501,7 +533,12 @@ function attachStt(downstream, cfg, connectionId) {
             finalizationInFlight = false;
             if (audioSequence <= finalizedAudioSequence) {
               speechSinceEndpoint = false;
+              audioSinceEndpoint = false;
               lastSpeechAt = 0;
+              lastAudioAt = 0;
+              speechFrames = 0;
+              silenceFrames = 0;
+              lastAudioRms = 0;
               clearTimer(silenceTimer);
               silenceTimer = undefined;
             } else {

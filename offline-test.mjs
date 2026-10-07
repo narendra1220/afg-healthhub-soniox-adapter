@@ -156,7 +156,9 @@ const adapter = createAdapter({
   sttUrl: `ws://127.0.0.1:${fakePort}/stt`,
   sttModel: 'offline-stt',
   sttAutoFinalizeSilenceMs: 20,
-  sttSilenceRmsThreshold: 1,
+  // The fixture is intentionally below this threshold. The adapter must
+  // still finalize when the gateway stops sending low-level PCM.
+  sttSilenceRmsThreshold: 200,
   ttsUrl: `ws://127.0.0.1:${fakePort}/tts`,
   ttsModel: 'offline-tts',
   ttsVoice: 'offline-voice',
@@ -193,7 +195,8 @@ try {
   assert.equal(secondResult.alternatives[0].transcript, 'Second turn.');
 
   // A real Artemis stream does not send the adapter-specific finalize control.
-  // A short PCM silence boundary must still finalize a third turn.
+  // A short low-level PCM stream must still finalize a third turn when the
+  // gateway stops sending audio without an explicit finalize control.
   const autoFinalTranscriptPromise = waitFor(stt, (value) => value.is_final === true);
   stt.send(pcm);
   const autoFinalResult = await autoFinalTranscriptPromise;
