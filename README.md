@@ -1,5 +1,38 @@
 # HealthHub Soniox BYO speech adapter
 
+## Adapter-only STT restart update (8 October 2026)
+
+This package adds prompt shutdown for completed STT recognizers and preserves
+tokens following Soniox endpoint markers. No KoreVG or Runtime code change is
+included. See `VERIFICATION.md` for measured local results and the live-call
+verification boundary.
+
+- After a final transcript has been emitted, gateway `stop` closes the STT
+  socket immediately and cancels any unfinalized tail audio on that socket.
+- Before the first final, `stop` allows up to **200 ms** for provider finalization.
+  A final arriving later is intentionally cancelled rather than holding up the
+  replacement recognizer. Normal provider endpoint detection is unchanged.
+- A normal WebSocket close is attempted first. If the peer does not acknowledge
+  within **250 ms**, the adapter terminates the old downstream socket. This
+  bounds the adapter-side shutdown wait below the observed three-second gateway
+  force-close window while the process and transport are responsive.
+- STT logs include `callSid` when supplied in `start.options.callSid`, plus
+  `ASR_STOP_RECEIVED`, `ASR_STOP`, `ASR_SOCKET_CLOSE`, and `ASR_CLOSE_TIMEOUT`.
+
+Run `pnpm check` and `pnpm test` after installing dependencies. The new
+`lifecycle-test.mjs` uses real local WebSocket/TCP connections, a mock provider,
+and a model of the inspected gateway registry cleanup. It makes no live speech
+provider requests. The persistent-socket probes below remain useful protocol
+checks, but do not replace an actual gateway call.
+
+For staging acceptance after deploying this code, make a real call with at least
+three user utterances. Confirm a final transcript and response for every turn,
+match Call-SID in the adapter logs, and check that old STT sockets close before
+KoreVG reports a three-second forced-close timeout. A missing
+`ASR_STOP_RECEIVED` means this workaround has not established that the hosted
+adapter receives the gateway control; check routing/deployment before assuming
+the timer change fixes the call.
+
 This is a test WebSocket adapter for the AFG HealthHub Pipeline Voice path.
 Artemis sends raw caller PCM to `/stt` and streamed agent text to `/tts`; this
 service translates both directions to the Soniox real-time APIs.
@@ -211,7 +244,9 @@ the audio socket open and Soniox's semantic endpoint is delayed. The fallback
 uses detected speech silence when possible and also finalizes after inbound PCM
 goes idle, which covers low-volume speech and gateways that stop sending audio
 without sending an explicit control message. The same socket remains usable for
-the next utterance; `stop` drains one pending final before closing.
+the next utterance. The updated `stop` policy is described above: completed
+recognizers close immediately; before the first final, drain is bounded to
+200 ms and may cancel unfinished speech.
 
 ## HealthHub channel configuration
 

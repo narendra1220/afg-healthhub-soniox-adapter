@@ -1,7 +1,7 @@
-.env
-*.pcm
-*.wav
 node_modules/
-npm-debug.log*
-pnpm-debug.log*
-yarn-debug.log*
+.env
+*.log
+verification/
+*-output*.txt
+node22-download-metadata.json
+.DS_Store

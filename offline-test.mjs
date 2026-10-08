@@ -66,18 +66,20 @@ assert.equal(final[0].is_final, true);
 assert.deepEqual(buffer.consume({ tokens: [{ text: '<end>', is_final: true }] }, true), []);
 
 const multiBuffer = createTranscriptBuffer();
-const firstWithReplay = multiBuffer.consume(
+const firstWithNextSegment = multiBuffer.consume(
   {
     tokens: [
       { text: 'first', confidence: 0.9, is_final: true },
       { text: '<end>', is_final: true },
-      { text: 'replayed', confidence: 0.9, is_final: true },
+      { text: 'next ', confidence: 0.9, is_final: true },
     ],
   },
   true,
 );
-assert.equal(firstWithReplay.length, 1);
-assert.equal(firstWithReplay[0].alternatives[0].transcript, 'first');
+assert.equal(firstWithNextSegment.length, 2);
+assert.equal(firstWithNextSegment[0].alternatives[0].transcript, 'first');
+assert.equal(firstWithNextSegment[1].alternatives[0].transcript, 'next');
+assert.equal(firstWithNextSegment[1].is_final, false);
 const secondWithFin = multiBuffer.consume(
   {
     tokens: [
@@ -88,7 +90,16 @@ const secondWithFin = multiBuffer.consume(
   true,
 );
 assert.equal(secondWithFin.length, 1);
-assert.equal(secondWithFin[0].alternatives[0].transcript, 'second');
+assert.equal(secondWithFin[0].alternatives[0].transcript, 'next second');
+
+const twoSegments = createTranscriptBuffer().consume({ tokens: [
+  { text: 'First turn.', is_final: true },
+  { text: '<end>', is_final: true },
+  { text: 'Second turn.', is_final: true },
+  { text: '<fin>', is_final: true },
+] }, true);
+assert.deepEqual(twoSegments.map(x => x.alternatives[0].transcript), ['First turn.', 'Second turn.']);
+assert.ok(twoSegments.every(x => x.is_final));
 
 const fakeHttp = http.createServer();
 const fakeWs = new WebSocketServer({ server: fakeHttp });
@@ -122,7 +133,6 @@ fakeWs.on('connection', (ws, req) => {
               { text: 'Hello', confidence: 0.9, is_final: true },
               { text: ' world!', confidence: 0.9, is_final: true },
               { text: '<end>', is_final: true },
-              { text: 'replayed', confidence: 0.9, is_final: true },
             ]
           : [
               { text: 'Second', confidence: 0.9, is_final: true },
@@ -202,8 +212,8 @@ try {
   const autoFinalResult = await autoFinalTranscriptPromise;
   assert.equal(autoFinalResult.alternatives[0].transcript, 'Second turn.');
 
-  // A stop arriving before the upstream endpoint must drain the pending turn
-  // instead of dropping it silently.
+  // Before the first final, stop allows a short bounded drain when the
+  // provider responds promptly. Slow providers are covered by lifecycle tests.
   const stopDrain = await openClient(`ws://127.0.0.1:${adapterPort}/stt`);
   const stopFinalTranscriptPromise = waitFor(stopDrain, (value) => value.is_final === true);
   stopDrain.send(

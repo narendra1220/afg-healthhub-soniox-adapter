@@ -8,8 +8,8 @@
     "node": ">=18"
   },
   "scripts": {
-    "check": "node --check adapter.mjs && node --check offline-test.mjs && node --check probe-stt.mjs",
-    "test": "node offline-test.mjs",
+    "check": "node --check adapter.mjs && node --check offline-test.mjs && node --check lifecycle-test.mjs && node --check probe-stt.mjs && node --check probe-tts.mjs && node --check probe-call-loop.mjs",
+    "test": "node offline-test.mjs && node lifecycle-test.mjs",
     "start": "node adapter.mjs"
   },
   "dependencies": {

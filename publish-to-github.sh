@@ -9,6 +9,7 @@ remote_url=${GITHUB_REMOTE_URL:-}
 readonly files_to_publish=(
   adapter.mjs
   offline-test.mjs
+  lifecycle-test.mjs
   probe-stt.mjs
   probe-tts.mjs
   probe-call-loop.mjs
@@ -17,6 +18,7 @@ readonly files_to_publish=(
   Dockerfile
   render.yaml
   README.md
+  VERIFICATION.md
   .env.example
   .gitignore
   artemis-provider-registration.example.json
@@ -44,6 +46,7 @@ fi
 readonly secret_scan_files=(
   adapter.mjs
   offline-test.mjs
+  lifecycle-test.mjs
   probe-stt.mjs
   probe-tts.mjs
   probe-call-loop.mjs

@@ -12,7 +12,10 @@ const MAX_SESSION_MS = 15 * 60 * 1000;
 const START_TIMEOUT_MS = 10_000;
 const DEFAULT_AUTO_FINALIZE_SILENCE_MS = 750;
 const DEFAULT_SILENCE_RMS_THRESHOLD = 200;
-const STOP_FINALIZE_TIMEOUT_MS = 2_000;
+// KoreVG force-closes old recognizers after 3 seconds. Keep cancellation and
+// the downstream close handshake well inside that window.
+const STOP_FINALIZE_TIMEOUT_MS = 200;
+const STT_CLOSE_TIMEOUT_MS = 250;
 const SUPPORTED_SAMPLE_RATES = new Set([8000, 16000, 24000, 48000]);
 const SUPPORTED_TTS_SAMPLE_RATES = new Set([8000, 16000, 24000, 44100, 48000]);
 const LOG_TRANSCRIPTS = process.env.ADAPTER_LOG_TRANSCRIPTS === 'true';
@@ -129,20 +132,15 @@ export function createTranscriptBuffer() {
     consume(result, emitInterim) {
       const output = [];
       interim = [];
-      let endpointSeen = false;
-
       for (const token of result.tokens ?? []) {
         if (!token || typeof token.text !== 'string') {
           throw new Error('INVALID_TOKEN');
         }
-        // Soniox may include tokens after <end>/<fin> that belong to the
-        // response replay. They are returned again in a later response, so
-        // never let them leak into the next downstream turn.
-        if (endpointSeen) continue;
+        // Endpoints finish a segment, not the whole response. Final tokens
+        // are delivered once; retain following tokens for the next segment.
         if (token.text === '<end>' || token.text === '<fin>') {
           const final = flush();
           if (final) output.push(final);
-          endpointSeen = true;
         } else if (token.translation_status !== 'translation') {
           (token.is_final ? stable : interim).push(token);
         }
@@ -183,6 +181,9 @@ function attachStt(downstream, cfg, connectionId) {
   let language;
   let silenceTimer;
   let stopTimer;
+  let closeTimer;
+  let stopStartedAt;
+  let callSid;
   let stopRequested = false;
   let finalizationInFlight = false;
   let audioSequence = 0;
@@ -200,7 +201,11 @@ function attachStt(downstream, cfg, connectionId) {
   let finalCount = 0;
   const transcripts = createTranscriptBuffer();
 
-  logEvent('ASR_SOCKET_OPEN', { connectionId });
+  function logStt(event, fields = {}) {
+    logEvent(event, { connectionId, ...(callSid ? { callSid } : {}), ...fields });
+  }
+
+  logStt('ASR_SOCKET_OPEN', { connectionId });
 
   const startDeadline = setTimeout(() => fail('START_TIMEOUT'), START_TIMEOUT_MS);
   const lifetime = setTimeout(() => fail('SESSION_LIMIT'), MAX_SESSION_MS);
@@ -228,10 +233,27 @@ function attachStt(downstream, cfg, connectionId) {
     }
   }
 
+  function closeDownstream(code, reason) {
+    if (downstream.readyState === WebSocket.CLOSED) return;
+    const closeStartedAt = Date.now();
+    if (downstream.readyState === WebSocket.OPEN) downstream.close(code, reason);
+    if (closeTimer) return;
+    // Bound every terminal STT close, including provider completion/error, so
+    // a later stop cannot get stuck behind ws's default 30-second close wait.
+    closeTimer = setTimeout(() => {
+      if (downstream.readyState !== WebSocket.CLOSED) {
+        logStt('ASR_CLOSE_TIMEOUT', {
+          elapsedMs: Date.now() - (stopStartedAt ?? closeStartedAt),
+        });
+        downstream.terminate();
+      }
+    }, STT_CLOSE_TIMEOUT_MS);
+  }
+
   function fail(code) {
     if (closing) return;
     closing = true;
-    logEvent('ASR_ERROR', {
+    logStt('ASR_ERROR', {
       connectionId,
       code,
       audioBytes,
@@ -251,15 +273,13 @@ function attachStt(downstream, cfg, connectionId) {
     } catch {
       // The gateway may already have disconnected.
     }
-    if (downstream.readyState === WebSocket.OPEN) {
-      downstream.close(1011, 'STT adapter error');
-    }
+    closeDownstream(1011, 'STT adapter error');
   }
 
   function finishStop() {
     if (closing) return;
     closing = true;
-    logEvent('ASR_STOP', {
+    logStt('ASR_STOP', {
       connectionId,
       audioBytes,
       audioFrames,
@@ -269,9 +289,7 @@ function attachStt(downstream, cfg, connectionId) {
       finalCount,
     });
     cleanup();
-    if (downstream.readyState === WebSocket.OPEN) {
-      downstream.close(1000, 'STT stopped');
-    }
+    closeDownstream(1000, 'STT stopped');
   }
 
   function requestFinalize(reason) {
@@ -280,7 +298,7 @@ function attachStt(downstream, cfg, connectionId) {
 
     finalizationInFlight = true;
     finalizeRequestSequence = audioSequence;
-    logEvent('ASR_FINALIZE_REQUEST', {
+    logStt('ASR_FINALIZE_REQUEST', {
       connectionId,
       reason,
       audioFrames,
@@ -332,7 +350,18 @@ function attachStt(downstream, cfg, connectionId) {
   function stop() {
     if (closing || stopRequested) return;
     stopRequested = true;
+    stopStartedAt = Date.now();
     clearTimer(silenceTimer);
+
+    logStt('ASR_STOP_RECEIVED', {
+      finalCount,
+      audioFrames,
+      finalizationInFlight,
+      drainBudgetMs: finalCount > 0 ? 0 : STOP_FINALIZE_TIMEOUT_MS,
+    });
+    // After a delivered final, gateway stop cancels this recognizer. Later
+    // PCM or an in-flight finalize must not hold up its replacement.
+    if (finalCount > 0) return finishStop();
 
     const needsFinalization =
       finalizationInFlight ||
@@ -340,13 +369,14 @@ function attachStt(downstream, cfg, connectionId) {
     if (!needsFinalization) return finishStop();
 
     if (!finalizationInFlight) requestFinalize('gateway_stop');
+    if (closing) return;
     stopTimer = setTimeout(finishStop, STOP_FINALIZE_TIMEOUT_MS);
   }
 
   function complete() {
     if (closing) return;
     closing = true;
-    logEvent('ASR_COMPLETE', {
+    logStt('ASR_COMPLETE', {
       connectionId,
       audioBytes,
       audioFrames,
@@ -356,24 +386,24 @@ function attachStt(downstream, cfg, connectionId) {
       finalCount,
     });
     cleanup();
-    if (downstream.readyState === WebSocket.OPEN) {
-      downstream.close(1000, 'Transcription complete');
-    }
+    closeDownstream(1000, 'Transcription complete');
   }
 
   downstream.on('error', () => fail('DOWNSTREAM_ERROR'));
-  downstream.on('close', () => {
-    if (!closing) {
-      logEvent('ASR_SOCKET_CLOSE', {
-        connectionId,
-        audioBytes,
-        audioFrames,
-        lastAudioRms: Math.round(lastAudioRms),
-        speechFrames,
-        silenceFrames,
-        finalCount,
-      });
-    }
+  downstream.on('close', (code) => {
+    closing = true;
+    clearTimer(closeTimer);
+    logStt('ASR_SOCKET_CLOSE', {
+      code,
+      stopRequested,
+      ...(stopStartedAt !== undefined ? { stopElapsedMs: Date.now() - stopStartedAt } : {}),
+      audioBytes,
+      audioFrames,
+      lastAudioRms: Math.round(lastAudioRms),
+      speechFrames,
+      silenceFrames,
+      finalCount,
+    });
     cleanup();
   });
 
@@ -401,7 +431,7 @@ function attachStt(downstream, cfg, connectionId) {
         }
         scheduleSilenceFinalize();
         if (audioFrames === 1 || audioFrames % 50 === 0) {
-          logEvent('ASR_AUDIO', {
+          logStt('ASR_AUDIO', {
             connectionId,
             audioFrames,
             audioBytes,
@@ -435,7 +465,7 @@ function attachStt(downstream, cfg, connectionId) {
         if (message.sampleRateHz !== sampleRateHz || languageHint(message.language) !== language) {
           return fail('INVALID_START');
         }
-        logEvent('ASR_START_DUPLICATE', { connectionId });
+        logStt('ASR_START_DUPLICATE', { connectionId });
         return;
       }
 
@@ -453,10 +483,13 @@ function attachStt(downstream, cfg, connectionId) {
 
       language = languageHint(message.language);
       sampleRateHz = message.sampleRateHz;
+      if (typeof message.options?.callSid === 'string' && message.options.callSid.length <= 128) {
+        callSid = message.options.callSid;
+      }
       started = true;
       emitInterim = message.interimResults === true;
       clearTimer(startDeadline);
-      logEvent('ASR_START', {
+      logStt('ASR_START', {
         connectionId,
         language: message.language,
         sampleRateHz: message.sampleRateHz,
@@ -471,17 +504,17 @@ function attachStt(downstream, cfg, connectionId) {
       });
 
       upstream.on('error', () => {
-        logEvent('ASR_UPSTREAM_ERROR', { connectionId });
+        logStt('ASR_UPSTREAM_ERROR', { connectionId });
         fail('SONIOX_CONNECTION_ERROR');
       });
       upstream.on('close', () => {
-        logEvent('ASR_UPSTREAM_CLOSE', { connectionId });
+        logStt('ASR_UPSTREAM_CLOSE', { connectionId });
         if (!closing) fail('SONIOX_DISCONNECTED');
       });
       upstream.on('open', () => {
         if (closing) return upstream.terminate();
         try {
-          logEvent('ASR_UPSTREAM_OPEN', { connectionId });
+          logStt('ASR_UPSTREAM_OPEN', { connectionId });
           sendJson(upstream, {
             model: cfg.sttModel,
             audio_format: 'pcm_s16le',
@@ -510,14 +543,14 @@ function attachStt(downstream, cfg, connectionId) {
             if (transcript.is_final) {
               finalCount += 1;
               const finalText = transcript.alternatives?.[0]?.transcript || '';
-              logEvent('ASR_FINAL', {
+              logStt('ASR_FINAL', {
                 connectionId,
                 sequence: finalCount,
                 characters: finalText.length,
                 ...(LOG_TRANSCRIPTS ? { transcript: finalText } : {}),
               });
             } else {
-              logEvent('ASR_INTERIM', {
+              logStt('ASR_INTERIM', {
                 connectionId,
                 characters: transcript.alternatives?.[0]?.transcript?.length || 0,
               });
